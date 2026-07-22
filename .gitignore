@@ -35,6 +35,7 @@ thumbnails/
 .vscode/
 .DS_Store
 
-# Private project notes and source specification
+# Local planning and design references
 agent-dev-journal.md
 linux_gallery_photos_app_spec.md
+gallery_*.html
