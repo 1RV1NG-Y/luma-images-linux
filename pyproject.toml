@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "luma-gallery"
+version = "0.1.0"
+description = "A filesystem-first photo library for Linux"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.8",
+]
+
+[project.scripts]
+luma-gallery = "simple_gallery.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/simple_gallery"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
