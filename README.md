@@ -20,6 +20,7 @@ Filesystem operations are deliberately distinct from application-only metadata. 
 - Preserve records and virtual metadata when files or registered drives are temporarily unavailable.
 - Relink an unavailable library after a removable drive returns at a different mount path.
 - Switch between persistent light and dark themes.
+- Install a native GNOME launcher and icon for application search and dash pinning.
 
 Supported image extensions currently include JPEG, PNG, WebP, GIF, BMP, and TIFF.
 
@@ -35,6 +36,24 @@ uv run luma-gallery
 ```
 
 On the first launch, choose **Add folder** and select a directory containing images. Luma will index it in the background and generate thumbnails as they become visible.
+
+### GNOME desktop installation
+
+Install Luma as a user-level application, then register its launcher and icon:
+
+```bash
+uv tool install .
+luma-gallery-install
+```
+
+No administrator access is required. The installer writes `luma-gallery.desktop` and the supplied icon to the standard user XDG data locations. Search for **Luma** in GNOME, launch it, then select **Pin to Dash** or **Add to Favorites**.
+
+After pulling an update, refresh the installed application with:
+
+```bash
+uv tool install --force .
+luma-gallery-install
+```
 
 ## File and metadata ownership
 

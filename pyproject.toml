@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 luma-gallery = "simple_gallery.app:main"
+luma-gallery-install = "simple_gallery.desktop_install:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/simple_gallery"]

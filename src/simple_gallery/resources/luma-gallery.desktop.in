@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Luma
+GenericName=Photo Library
+Comment=Browse and organize existing photo folders
+Exec=@EXECUTABLE@
+Icon=@ICON@
+Terminal=false
+Categories=Graphics;Photography;
+Keywords=Photos;Images;Gallery;Albums;
+StartupNotify=true
+StartupWMClass=Luma

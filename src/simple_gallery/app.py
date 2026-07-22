@@ -4,10 +4,14 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, QSettings, QStandardPaths
+from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtWidgets import QApplication
 
 from .main_window import MainWindow
 from .styles import apply_theme
+
+APP_ID = "luma-gallery"
+ICON_PATH = Path(__file__).parent / "resources" / "luma-gallery.png"
 
 
 def application_paths() -> tuple[Path, Path]:
@@ -23,6 +27,8 @@ def main() -> int:
     QCoreApplication.setOrganizationDomain("app.luma.gallery")
     QCoreApplication.setApplicationName("Luma")
     application = QApplication(sys.argv)
+    QGuiApplication.setDesktopFileName(APP_ID)
+    application.setWindowIcon(QIcon(str(ICON_PATH)))
     application.setStyle("Fusion")
     apply_theme(application, str(QSettings().value("appearance/theme", "light")))
 

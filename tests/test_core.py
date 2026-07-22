@@ -9,11 +9,13 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop, QPoint, QPointF, QSettings, QTimer, Qt
+from PySide6.QtCore import QCoreApplication, QEventLoop, QPoint, QPointF, QSettings, QSize, QTimer, Qt
 
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
+from simple_gallery.app import APP_ID, ICON_PATH
+from simple_gallery.desktop_install import ICON_SIZES, _install_desktop_entry, _install_icons
 from simple_gallery.database import Database
 from simple_gallery.file_operations import FileOperationError, FileOperations
 from simple_gallery.main_window import MainWindow
@@ -552,6 +554,28 @@ class AppearanceContracts(unittest.TestCase):
         image_pool.start.assert_called_once()
         viewer.close()
         database.close()
+
+    def test_desktop_installer_writes_gnome_entry_and_icon_theme(self) -> None:
+        workspace = fresh_workspace()
+        data_home = workspace / "share"
+        executable = workspace / "tool bin" / APP_ID
+        executable.parent.mkdir()
+        executable.touch()
+
+        icon_path = _install_icons(data_home)
+        desktop_entry = _install_desktop_entry(data_home, executable, icon_path)
+
+        self.assertTrue(ICON_PATH.is_file())
+        self.assertEqual(desktop_entry, data_home / "applications" / f"{APP_ID}.desktop")
+        desktop_text = desktop_entry.read_text(encoding="utf-8")
+        self.assertIn("Name=Luma", desktop_text)
+        self.assertIn(f'Exec="{executable}"', desktop_text)
+        self.assertIn(f"Icon={icon_path}", desktop_text)
+        self.assertIn("StartupWMClass=Luma", desktop_text)
+        self.assertEqual(QImage(str(icon_path)).size(), QSize(1024, 1024))
+        for size in ICON_SIZES:
+            icon = data_home / "icons" / "hicolor" / f"{size}x{size}" / "apps" / f"{APP_ID}.png"
+            self.assertEqual(QImage(str(icon)).size(), QSize(size, size))
 
     def test_large_gallery_only_requests_visible_thumbnails(self) -> None:
         QSettings().setValue("appearance/theme", "light")
