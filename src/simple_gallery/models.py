@@ -53,6 +53,7 @@ class Library:
     last_scan: str | None
     available: bool = True
     last_error: str | None = None
+    mount_path: str | None = None
 
     @classmethod
     def from_row(cls, row: Any) -> "Library":

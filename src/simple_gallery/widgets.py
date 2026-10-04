@@ -2,8 +2,28 @@ from __future__ import annotations
 
 import json
 
-from PySide6.QtCore import QMimeData, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QDrag, QFont, QFontMetrics, QPainter, QPainterPath, QPalette, QPen, QPixmap
+from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QMimeData,
+    QPropertyAnimation,
+    QRect,
+    QSize,
+    Qt,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QDrag,
+    QFont,
+    QFontMetrics,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+    QPixmap,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFormLayout,
@@ -25,7 +45,6 @@ from PySide6.QtWidgets import (
 )
 
 from .models import Album, ImageRecord
-
 
 ROLE_IMAGE_ID = int(Qt.ItemDataRole.UserRole) + 1
 ROLE_RECORD = ROLE_IMAGE_ID + 1
@@ -123,6 +142,41 @@ class GalleryList(QListWidget):
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        scrollbar = self.verticalScrollBar()
+        self._scroll_animation = QPropertyAnimation(scrollbar, b"value", self)
+        self._scroll_animation.setDuration(140)
+        self._scroll_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        scrollbar.sliderPressed.connect(self._scroll_animation.stop)
+        scrollbar.actionTriggered.connect(self._scroll_animation.stop)
+        scrollbar.rangeChanged.connect(self._scroll_animation.stop)
+        self._scroll_target = 0
+        self._scroll_direction = 0
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if event.modifiers() or not (event.pixelDelta().y() or event.angleDelta().y()):
+            super().wheelEvent(event)
+            return
+        scrollbar = self.verticalScrollBar()
+        if event.pixelDelta().y():
+            # Preserve precise touchpad motion without adding a second momentum curve.
+            self._scroll_animation.stop()
+            scrollbar.setValue(scrollbar.value() - event.pixelDelta().y())
+        else:
+            delta = -event.angleDelta().y() / 120 * 72
+            direction = 1 if delta > 0 else -1
+            running = self._scroll_animation.state() == QAbstractAnimation.State.Running
+            start = self._scroll_target if running and direction == self._scroll_direction else scrollbar.value()
+            self._scroll_target = max(scrollbar.minimum(), min(scrollbar.maximum(), round(start + delta)))
+            self._scroll_direction = direction
+            self._scroll_animation.stop()
+            self._scroll_animation.setStartValue(scrollbar.value())
+            self._scroll_animation.setEndValue(self._scroll_target)
+            self._scroll_animation.start()
+        event.accept()
+
+    def clear(self) -> None:
+        self._scroll_animation.stop()
+        super().clear()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

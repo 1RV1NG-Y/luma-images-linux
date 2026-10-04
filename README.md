@@ -19,6 +19,8 @@ Filesystem operations are deliberately distinct from application-only metadata. 
 - Reconcile external renames using filesystem identity where possible.
 - Preserve records and virtual metadata when files or registered drives are temporarily unavailable.
 - Relink an unavailable library after a removable drive returns at a different mount path.
+- Unlink a registered folder from its sidebar right-click menu without deleting original files.
+- Scroll through the gallery with smaller, smoothly animated mouse-wheel steps.
 - Switch between persistent light and dark themes.
 - Install a native GNOME launcher and icon for application search and dash pinning.
 
@@ -36,6 +38,10 @@ uv run luma-gallery
 ```
 
 On the first launch, choose **Add folder** and select a directory containing images. Luma will index it in the background and generate thumbnails as they become visible.
+
+Use **Rescan** to reconcile additions, deletions, and external renames. If a drive is offline or a scan cannot finish because of a read error, Luma preserves the previous catalog and its metadata. Registered mount points are remembered so an empty directory left by an unmounted drive is treated as offline. Mount or unlock the drive and rescan; if its path changed, right-click its registered folder and choose **Locate or reconnect folder…**.
+
+To stop indexing a folder, right-click its registered root in the sidebar and choose **Unlink folder…**. The confirmation explains that original files stay on disk, while the folder's catalog records, saved photo details, tags, ratings, favorites, and album memberships are removed. Existing albums remain; adding the folder again starts a fresh catalog entry.
 
 ### GNOME desktop installation
 

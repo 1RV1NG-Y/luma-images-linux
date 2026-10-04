@@ -9,18 +9,32 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop, QPoint, QPointF, QSettings, QSize, QTimer, Qt
-
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QWheelEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEventLoop,
+    QPoint,
+    QPointF,
+    QSettings,
+    QSize,
+    Qt,
+    QTimer,
+)
+from PySide6.QtGui import QAction, QColor, QImage, QImageReader, QMouseEvent, QPixmap, QWheelEvent
+from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox, QToolButton
+from PySide6.QtTest import QTest
 
 from simple_gallery.app import APP_ID, ICON_PATH
-from simple_gallery.desktop_install import ICON_SIZES, _install_desktop_entry, _install_icons
 from simple_gallery.database import Database
+from simple_gallery.desktop_install import (
+    ICON_SIZES,
+    _install_desktop_entry,
+    _install_icons,
+)
 from simple_gallery.file_operations import FileOperationError, FileOperations
 from simple_gallery.main_window import MainWindow
 from simple_gallery.scanner import scan_library
-from simple_gallery.viewer import ImageViewer
+from simple_gallery.viewer import FullImageTask, ImageViewer
+from simple_gallery.widgets import ROLE_FAVORITE, ROLE_IMAGE_ID, GalleryList
 
 
 def fresh_workspace() -> Path:
@@ -37,6 +51,182 @@ def create_image(path: Path, color: str = "#688fba") -> None:
 
 
 class CatalogContracts(unittest.TestCase):
+    def test_image_read_failure_preserves_previous_catalog(self) -> None:
+        workspace = fresh_workspace()
+        photos = workspace / "photos"
+        photos.mkdir()
+        create_image(photos / "original.jpg")
+        database = Database(workspace / "library.sqlite3")
+        library = database.add_library(photos)
+        scan_library(database, library)
+        record = database.images()[0]
+        reader = Mock()
+        reader.size.return_value = QSize()
+        reader.error.return_value = QImageReader.ImageReaderError.DeviceError
+        reader.errorString.return_value = "Permission denied"
+        with patch("simple_gallery.scanner.QImageReader", return_value=reader) as reader_class:
+            reader_class.ImageReaderError = QImageReader.ImageReaderError
+            result = scan_library(database, library)
+        self.assertIn("Permission denied", result.error)
+        self.assertFalse(database.image(record.id).missing)
+        database.close()
+
+    def test_existing_database_migrates_mount_tracking_without_losing_metadata(self) -> None:
+        workspace = fresh_workspace()
+        photos = workspace / "photos"
+        photos.mkdir()
+        create_image(photos / "original.jpg")
+        database_path = workspace / "library.sqlite3"
+        database = Database(database_path)
+        library = database.add_library(photos)
+        scan_library(database, library)
+        record = database.images()[0]
+        database.replace_tags(record.id, ["keep"])
+        database.connection.execute("ALTER TABLE libraries DROP COLUMN mount_path")
+        database.connection.commit()
+        database.close()
+        migrated = Database(database_path)
+        self.assertIsNone(migrated.library(library.id).mount_path)
+        self.assertEqual(migrated.images()[0].id, record.id)
+        self.assertEqual(migrated.tags_for_image(record.id), ["keep"])
+        scan_library(migrated, migrated.library(library.id))
+        self.assertTrue(migrated.library(library.id).available)
+        migrated.close()
+
+    def test_unlink_removes_catalog_metadata_and_keeps_originals_and_other_libraries(self) -> None:
+        workspace = fresh_workspace()
+        photos = workspace / "photos"
+        other = workspace / "other"
+        photos.mkdir()
+        other.mkdir()
+        original = photos / "keeper.jpg"
+        create_image(original)
+        create_image(other / "other.jpg")
+        original_bytes = original.read_bytes()
+        database = Database(workspace / "library.sqlite3")
+        library = database.add_library(photos)
+        other_library = database.add_library(other)
+        scan_library(database, library)
+        scan_library(database, other_library)
+        record = database.images(mode="folder", value=library.id)[0]
+        other_record = database.images(mode="folder", value=other_library.id)[0]
+        album = database.create_album("Keepers")
+        database.add_to_album(album.id, [record.id, other_record.id])
+        database.replace_tags(record.id, ["keeper"])
+
+        database.unlink_library(library.id)
+        self.assertIsNone(database.library(library.id))
+        self.assertIsNone(database.image(record.id))
+        self.assertEqual(database.tags_for_image(record.id), [])
+        self.assertEqual([image.id for image in database.images(mode="album", value=album.id)], [other_record.id])
+        self.assertEqual(original.read_bytes(), original_bytes)
+        self.assertTrue(photos.is_dir())
+        self.assertEqual(database.connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+        relinked = database.add_library(photos)
+        scan_library(database, relinked)
+        self.assertNotEqual(database.images(mode="folder", value=relinked.id)[0].id, record.id)
+        database.close()
+
+    def test_unmounted_drive_with_empty_mountpoint_preserves_catalog_and_recovers(self) -> None:
+        workspace = fresh_workspace()
+        mount = workspace / "drive"
+        mount.mkdir()
+        create_image(mount / "archive.jpg")
+        database = Database(workspace / "library.sqlite3")
+        with patch("simple_gallery.database.os.path.ismount", side_effect=lambda path: str(path) == str(mount)):
+            library = database.add_library(mount)
+            scan_library(database, library)
+        record = database.images()[0]
+        last_scan = database.library(library.id).last_scan
+        database.close()
+        detached = workspace / "detached"
+        mount.rename(detached)
+        mount.mkdir()  # Linux can leave the underlying mountpoint in place.
+        database = Database(workspace / "library.sqlite3")
+        with patch("simple_gallery.scanner.os.path.ismount", return_value=False):
+            result = scan_library(database, database.library(library.id))
+        self.assertFalse(result.available)
+        self.assertFalse(database.image(record.id).missing)
+        self.assertEqual(database.library(library.id).last_scan, last_scan)
+        mount.rmdir()
+        detached.rename(mount)
+        with patch("simple_gallery.scanner.os.path.ismount", side_effect=lambda path: str(path) == str(mount)):
+            result = scan_library(database, database.library(library.id))
+        self.assertTrue(result.available)
+        self.assertEqual(database.images()[0].id, record.id)
+        database.close()
+
+    def test_directory_read_error_rolls_back_partial_scan_then_retry_reconciles(self) -> None:
+        workspace = fresh_workspace()
+        photos = workspace / "photos"
+        child = photos / "child"
+        child.mkdir(parents=True)
+        create_image(child / "original.jpg")
+        database = Database(workspace / "library.sqlite3")
+        library = database.add_library(photos)
+        scan_library(database, library)
+        record = database.images()[0]
+        database.replace_tags(record.id, ["keep"])
+        last_scan = database.library(library.id).last_scan
+        create_image(photos / "new.jpg")
+
+        def partial_walk(root, *, followlinks, onerror):
+            yield str(root), ["child"], ["new.jpg"]
+            onerror(PermissionError(13, "Permission denied", str(child)))
+
+        with patch("simple_gallery.scanner.os.walk", side_effect=partial_walk):
+            result = scan_library(database, library)
+        self.assertTrue(result.available)
+        self.assertIn("Scan incomplete", result.error)
+        self.assertEqual([image.id for image in database.images()], [record.id])
+        self.assertEqual(database.library(library.id).last_scan, last_scan)
+        self.assertEqual(database.tags_for_image(record.id), ["keep"])
+        result = scan_library(database, database.library(library.id))
+        self.assertIsNone(result.error)
+        self.assertEqual(result.discovered, 2)
+        self.assertIsNone(database.library(library.id).last_error)
+        database.close()
+
+    def test_drive_disappearing_mid_scan_does_not_commit_new_or_missing_records(self) -> None:
+        workspace = fresh_workspace()
+        photos = workspace / "photos"
+        photos.mkdir()
+        create_image(photos / "original.jpg")
+        database = Database(workspace / "library.sqlite3")
+        library = database.add_library(photos)
+        scan_library(database, library)
+        record = database.images()[0]
+        create_image(photos / "new.jpg")
+
+        def disconnect(_count, _path):
+            photos.rename(workspace / "detached")
+
+        result = scan_library(database, library, on_progress=disconnect)
+        self.assertFalse(result.available)
+        self.assertFalse(database.image(record.id).missing)
+        self.assertEqual([image.id for image in database.images()], [record.id])
+        database.close()
+
+    def test_cancelled_scan_preserves_previous_catalog(self) -> None:
+        workspace = fresh_workspace()
+        photos = workspace / "photos"
+        photos.mkdir()
+        create_image(photos / "original.jpg")
+        database = Database(workspace / "library.sqlite3")
+        library = database.add_library(photos)
+        scan_library(database, library)
+        record = database.images()[0]
+        create_image(photos / "new.jpg")
+        stopped = False
+
+        def stop(_count, _path):
+            nonlocal stopped
+            stopped = True
+
+        scan_library(database, library, should_stop=lambda: stopped, on_progress=stop)
+        self.assertEqual([image.id for image in database.images()], [record.id])
+        database.close()
+
     def test_external_rename_and_missing_state_preserve_identity_and_metadata(self) -> None:
         workspace = fresh_workspace()
         photos = workspace / "photos"
@@ -198,6 +388,345 @@ class AppearanceContracts(unittest.TestCase):
         QCoreApplication.setOrganizationName("LumaContractTests")
         QCoreApplication.setApplicationName(uuid.uuid4().hex)
         cls.application = QApplication.instance() or QApplication([])
+
+    def _cached_gallery_window(self) -> MainWindow:
+        workspace = fresh_workspace()
+        photos = workspace / "photos"
+        cache = workspace / "cache"
+        photos.mkdir()
+        cache.mkdir()
+        database = Database(workspace / "library.sqlite3")
+        library = database.add_library(photos)
+        thumbnail = QImage(80, 60, QImage.Format.Format_RGB32)
+        thumbnail.fill(QColor("#6688aa"))
+        image_ids = []
+        for index in range(60):
+            image_id, _ = database.upsert_scanned_image(
+                library_id=library.id,
+                path=str(photos / f"image-{index:04}.jpg"),
+                device_id=1, inode=index + 1, file_size=4096, modified_ns=1,
+                mime_type="image/jpeg", width=800, height=600,
+                date_taken="2026-07-21T12:00:00+00:00",
+            )
+            image_ids.append(image_id)
+            self.assertTrue(thumbnail.save(str(cache / f"{image_id}.jpg"), "JPEG", 80))
+        database.finish_library_scan(library.id, image_ids)
+        database.close()
+        window = MainWindow(workspace / "library.sqlite3", cache)
+        self.addCleanup(window.close)
+        window._startup_scan_timer.stop()
+        window.thumbnail_manager.request = Mock()
+        window.resize(1200, 760)
+        window.show()
+        self.application.processEvents()
+        window.gallery.doItemsLayout()
+        window._load_visible_thumbnails()
+        return window
+
+    def test_closing_viewer_preserves_gallery_thumbnails_selection_and_scroll(self) -> None:
+        window = self._cached_gallery_window()
+        scrollbar = window.gallery.verticalScrollBar()
+        scrollbar.setValue(400)
+        window._load_visible_thumbnails()
+        self.assertGreater(scrollbar.value(), 0)
+        image = next(
+            image for image in window.current_images
+            if window.gallery.visualItemRect(window._items_by_id[image.id]).intersects(window.gallery.viewport().rect())
+            and isinstance(window._items_by_id[image.id].data(Qt.ItemDataRole.DecorationRole), QPixmap)
+        )
+        item = window._items_by_id[image.id]
+        item.setSelected(True)
+        pixmap = item.data(Qt.ItemDataRole.DecorationRole)
+        self.assertIsInstance(pixmap, QPixmap)
+        self.assertFalse(pixmap.isNull())
+        selected_ids = [selected.data(ROLE_IMAGE_ID) for selected in window.gallery.selectedItems()]
+        before_scroll = scrollbar.value()
+        before_items = dict(window._items_by_id)
+
+        def viewer_factory(*args):
+            viewer = ImageViewer(*args)
+            QTimer.singleShot(0, viewer.reject)
+            return viewer
+
+        with patch("simple_gallery.main_window.ImageViewer", side_effect=viewer_factory):
+            window.open_viewer(image.id)
+        self.assertEqual(scrollbar.value(), before_scroll)
+        self.assertEqual([selected.data(ROLE_IMAGE_ID) for selected in window.gallery.selectedItems()], selected_ids)
+        for image_id, original_item in before_items.items():
+            self.assertIs(window._items_by_id[image_id], original_item)
+        self.assertEqual(item.data(Qt.ItemDataRole.DecorationRole).cacheKey(), pixmap.cacheKey())
+
+    def test_viewer_favorite_updates_badge_and_inspector_without_clearing_thumbnail(self) -> None:
+        window = self._cached_gallery_window()
+        image = window.current_images[0]
+        item = window._items_by_id[image.id]
+        item.setSelected(True)
+        pixmap = item.data(Qt.ItemDataRole.DecorationRole)
+        self.assertFalse(pixmap.isNull())
+
+        def viewer_factory(*args):
+            viewer = ImageViewer(*args)
+
+            def toggle_and_close():
+                viewer._toggle_favorite()
+                viewer.reject()
+
+            QTimer.singleShot(0, toggle_and_close)
+            return viewer
+
+        with patch("simple_gallery.main_window.ImageViewer", side_effect=viewer_factory):
+            window.open_viewer(image.id)
+        self.assertIs(window._items_by_id[image.id], item)
+        self.assertEqual(item.data(Qt.ItemDataRole.DecorationRole).cacheKey(), pixmap.cacheKey())
+        self.assertTrue(item.data(ROLE_FAVORITE))
+        self.assertTrue(window.database.image(image.id).favorite)
+        self.assertTrue(window.current_images[0].favorite)
+        self.assertTrue(window.inspector.favorite_button.isChecked())
+
+    def test_viewer_arrow_keys_navigate_on_first_press_from_every_focused_control(self) -> None:
+        window = self._cached_gallery_window()
+        viewer = ImageViewer(window.database, window.current_images, window.current_images[10].id, window.cache_dir)
+        self.addCleanup(viewer.close)
+        viewer.show()
+        viewer.activateWindow()
+        self.application.processEvents()
+        controls = [viewer.focusWidget(), viewer.filmstrip, *viewer.findChildren(QToolButton)]
+        self.assertIsNotNone(controls[0])
+        for control in controls:
+            with self.subTest(control=control.objectName()):
+                control.setFocus()
+                self.application.processEvents()
+                before = viewer.index
+                QTest.keyClick(control, Qt.Key.Key_Right)
+                self.assertEqual(viewer.index, before + 1)
+                self.assertEqual(viewer.name_label.text(), viewer.current.file_name)
+                QTest.keyClick(control, Qt.Key.Key_Left)
+                self.assertEqual(viewer.index, before)
+
+        viewer.image_view.setFocus()
+        for _ in range(5):
+            before = viewer.index
+            QTest.keyClick(viewer.image_view, Qt.Key.Key_Right)
+            self.assertEqual(viewer.index, before + 1)
+        viewer.filmstrip.setCurrentRow(len(viewer.images) - 1)
+        QTest.keyClick(viewer.filmstrip, Qt.Key.Key_Right)
+        self.assertEqual(viewer.index, 0)
+        QTest.keyClick(viewer.filmstrip, Qt.Key.Key_Left)
+        self.assertEqual(viewer.index, len(viewer.images) - 1)
+
+    def test_viewer_navigation_does_not_read_originals_on_ui_thread_and_ignores_stale_results(self) -> None:
+        window = self._cached_gallery_window()
+        image_pool = Mock()
+        tasks = []
+        image_pool.start.side_effect = tasks.append
+        original_paths = {image.path for image in window.current_images}
+        path_exists = Path.exists
+
+        def cached_file_exists(path):
+            self.assertNotIn(str(path), original_paths, "The UI must not probe an original on a slow drive")
+            return path_exists(path)
+
+        with (
+            patch("simple_gallery.viewer.QThreadPool.globalInstance", return_value=image_pool),
+            patch("simple_gallery.viewer.QImageReader") as reader,
+            patch("simple_gallery.viewer.Path.exists", cached_file_exists),
+        ):
+            viewer = ImageViewer(window.database, window.current_images, window.current_images[0].id, window.cache_dir)
+            self.addCleanup(viewer.close)
+            viewer.show()
+            viewer.activateWindow()
+            self.application.processEvents()
+            QTest.keyClick(viewer.image_view, Qt.Key.Key_Right)
+            self.assertEqual(viewer.index, 1)
+            self.assertEqual(viewer.name_label.text(), window.current_images[1].file_name)
+            self.assertFalse(viewer.image_view._pixmap.isNull())
+            self.assertEqual(len(tasks), 2)
+            reader.assert_not_called()
+
+        before_preview = viewer.image_view._pixmap.cacheKey()
+        decoded = QImage(640, 420, QImage.Format.Format_RGB32)
+        decoded.fill(QColor("#cc3311"))
+        tasks[0].signals.metadata_ready.emit(tasks[0].image_id, "Old camera", "Old lens")
+        tasks[0].signals.ready.emit(tasks[0].image_id, decoded)
+        self.assertEqual(viewer.detail_labels["Camera"].text(), "—")
+        self.assertEqual(viewer.image_view._pixmap.cacheKey(), before_preview)
+        tasks[1].signals.metadata_ready.emit(tasks[1].image_id, "Current camera", "Current lens")
+        tasks[1].signals.ready.emit(tasks[1].image_id, decoded)
+        self.assertEqual(viewer.detail_labels["Camera"].text(), "Current camera")
+        self.assertEqual(viewer.detail_labels["Lens"].text(), "Current lens")
+        self.assertEqual(viewer.image_view._pixmap.size(), decoded.size())
+        viewer.previous()
+        self.assertEqual(viewer.detail_labels["Camera"].text(), "Old camera")
+
+    def test_full_image_worker_loads_embedded_metadata_and_reports_unavailable_originals(self) -> None:
+        workspace = fresh_workspace()
+        source = workspace / "metadata.png"
+        image = QImage(640, 420, QImage.Format.Format_RGB32)
+        image.fill(QColor("#6688aa"))
+        image.setText("Make", "Test camera")
+        image.setText("Model", "Model 1")
+        image.setText("LensModel", "Test lens")
+        self.assertTrue(image.save(str(source), "PNG"))
+        task = FullImageTask("image-id", str(source))
+        metadata = []
+        decoded = []
+        task.signals.metadata_ready.connect(lambda *values: metadata.append(values))
+        task.signals.ready.connect(lambda image_id, image: decoded.append((image_id, image)))
+        task.run()
+        self.assertEqual(metadata, [("image-id", "Test camera Model 1", "Test lens")])
+        self.assertEqual(decoded[0][0], "image-id")
+        self.assertEqual(decoded[0][1].size(), image.size())
+
+        source.unlink()
+        unavailable = []
+        task.signals.failed.connect(lambda *values: unavailable.append(values))
+        task.run()
+        self.assertEqual(unavailable, [("image-id", "Original file is unavailable")])
+
+    def test_viewer_unfavorite_filters_gallery_in_place_and_preserves_viewer_navigation(self) -> None:
+        window = self._cached_gallery_window()
+        first, second = window.current_images[:2]
+        window.database.set_favorite([first.id, second.id], True)
+        window.select_mode("favorites", None, "Favorites", window.favorite_button)
+        self.application.processEvents()
+        window._load_visible_thumbnails()
+        second_item = window._items_by_id[second.id]
+        pixmap = second_item.data(Qt.ItemDataRole.DecorationRole)
+        self.assertFalse(pixmap.isNull())
+        viewers = []
+
+        def viewer_factory(*args):
+            viewer = ImageViewer(*args)
+            viewers.append(viewer)
+
+            def toggle_and_close():
+                viewer._toggle_favorite()
+                viewer.next()
+                viewer.reject()
+
+            QTimer.singleShot(0, toggle_and_close)
+            return viewer
+
+        with patch("simple_gallery.main_window.ImageViewer", side_effect=viewer_factory):
+            window.open_viewer(first.id)
+            self.assertEqual(len(viewers[0].images), 2)
+            self.assertEqual(viewers[0].current.id, second.id)
+            self.assertEqual(window.gallery.count(), 1)
+            self.assertEqual([image.id for image in window.current_images], [second.id])
+            self.assertIs(window._items_by_id[second.id], second_item)
+            self.assertEqual(second_item.data(Qt.ItemDataRole.DecorationRole).cacheKey(), pixmap.cacheKey())
+            self.assertTrue(window.page_subtitle.text().startswith("1 photo"))
+            window.open_viewer(second.id)
+        self.assertEqual(window.gallery.count(), 0)
+        self.assertEqual(window.current_images, [])
+        self.assertEqual(window.content_stack.currentIndex(), 2)
+        self.assertEqual(window.inspector.stack.currentIndex(), 0)
+        self.assertTrue(window.page_subtitle.text().startswith("0 photos"))
+
+    def test_sidebar_context_menu_unlinks_selected_subfolder_library_and_cancel_keeps_it(self) -> None:
+        workspace = fresh_workspace()
+        photos = workspace / "photos"
+        child = photos / "child"
+        child.mkdir(parents=True)
+        original = child / "original.jpg"
+        create_image(original)
+        window = MainWindow(workspace / "library.sqlite3", workspace / "cache")
+        library = window.database.add_library(photos)
+        scan_library(window.database, library)
+        window.expanded_folders.update([str(photos), str(child)])
+        window.reload_sidebar()
+        window.select_mode("folder_path", str(child), "child", window._folder_rows_by_path[str(child)].nav_button)
+        window._scan_queue.append(library)
+
+        with patch("simple_gallery.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Cancel):
+            window.unlink_library(library)
+        self.assertIsNotNone(window.database.library(library.id))
+        self.assertEqual(window.mode, "folder_path")
+
+        unlink_action = QAction("Unlink folder…")
+        menu = Mock()
+        menu.addAction.side_effect = lambda text: unlink_action if text == unlink_action.text() else QAction(text)
+        menu.exec.return_value = unlink_action
+        with (
+            patch("simple_gallery.main_window.QMenu", return_value=menu),
+            patch("simple_gallery.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes),
+        ):
+            window._library_context_menu(library, QPoint())
+        self.assertIsNone(window.database.library(library.id))
+        self.assertEqual(window.mode, "all")
+        self.assertEqual(window.gallery.count(), 0)
+        self.assertEqual(window._scan_queue, [])
+        self.assertNotIn(str(child), window.expanded_folders)
+        self.assertTrue(window.all_button.isChecked())
+        self.assertTrue(original.exists())
+        window.close()
+
+    def test_unlink_interrupts_active_scan_and_allows_remaining_library_to_scan(self) -> None:
+        workspace = fresh_workspace()
+        photos = workspace / "photos"
+        other = workspace / "other"
+        photos.mkdir()
+        other.mkdir()
+        create_image(photos / "first.jpg")
+        create_image(other / "second.jpg")
+        window = MainWindow(workspace / "library.sqlite3", workspace / "cache")
+        library = window.database.add_library(photos)
+        other_library = window.database.add_library(other)
+        window.queue_scan([library, other_library])
+        with patch("simple_gallery.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            window.unlink_library(library)
+        self.application.processEvents()
+        if window._scan_thread:
+            window._scan_thread.wait()
+            self.application.processEvents()
+        self.assertIsNone(window.database.library(library.id))
+        self.assertEqual([image.file_name for image in window.database.images()], ["second.jpg"])
+        self.assertTrue(window.rescan_button.isEnabled())
+        self.assertTrue((photos / "first.jpg").exists())
+        window.close()
+
+    def test_gallery_wheel_scroll_is_smaller_animated_and_touchpad_remains_precise(self) -> None:
+        gallery = GalleryList()
+        gallery.resize(500, 450)
+        for index in range(80):
+            gallery.addItem(QListWidgetItem(str(index)))
+        gallery.show()
+        self.application.processEvents()
+        scrollbar = gallery.verticalScrollBar()
+
+        def wheel(angle=0, pixels=0):
+            event = QWheelEvent(
+                QPointF(100, 100), QPointF(100, 100), QPoint(0, pixels), QPoint(0, angle),
+                Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False,
+            )
+            self.application.sendEvent(gallery.viewport(), event)
+
+        wheel(angle=-120)
+        self.assertEqual(scrollbar.value(), 0)
+        loop = QEventLoop()
+        QTimer.singleShot(75, loop.quit)
+        loop.exec()
+        self.assertGreater(scrollbar.value(), 0)
+        self.assertLess(scrollbar.value(), 72)
+        QTimer.singleShot(150, loop.quit)
+        loop.exec()
+        self.assertEqual(scrollbar.value(), 72)
+        wheel(angle=-120)
+        wheel(angle=-120)
+        QTimer.singleShot(200, loop.quit)
+        loop.exec()
+        self.assertEqual(scrollbar.value(), 216)
+        wheel(pixels=-11)
+        self.assertEqual(scrollbar.value(), 227)
+        wheel(angle=-120)
+        wheel(angle=120)  # Reversing direction must cancel the queued forward motion.
+        QTimer.singleShot(200, loop.quit)
+        loop.exec()
+        self.assertEqual(scrollbar.value(), 155)
+        gallery.clear()
+        self.application.processEvents()
+        self.assertEqual(scrollbar.value(), 0)
+        gallery.close()
 
     def test_dark_theme_persists_and_window_uses_integrated_chrome(self) -> None:
         QSettings().setValue("appearance/theme", "light")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -7,7 +8,6 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .models import Album, ImageRecord, Library
-
 
 IMAGE_COLUMNS = """
     id, library_id, path, device_id, inode, file_size, modified_ns,
@@ -113,6 +113,8 @@ class Database:
             )
         if "last_error" not in library_columns:
             self.connection.execute("ALTER TABLE libraries ADD COLUMN last_error TEXT")
+        if "mount_path" not in library_columns:
+            self.connection.execute("ALTER TABLE libraries ADD COLUMN mount_path TEXT")
         self.connection.commit()
 
     def close(self) -> None:
@@ -121,13 +123,13 @@ class Database:
     # Libraries ---------------------------------------------------------
     def libraries(self) -> list[Library]:
         rows = self.connection.execute(
-            "SELECT id, path, name, created_at, last_scan, available, last_error FROM libraries ORDER BY name COLLATE NOCASE"
+            "SELECT * FROM libraries ORDER BY name COLLATE NOCASE"
         ).fetchall()
         return [Library.from_row(row) for row in rows]
 
     def library(self, library_id: str) -> Library | None:
         row = self.connection.execute(
-            "SELECT id, path, name, created_at, last_scan, available, last_error FROM libraries WHERE id = ?",
+            "SELECT * FROM libraries WHERE id = ?",
             (library_id,),
         ).fetchone()
         return Library.from_row(row) if row else None
@@ -146,7 +148,7 @@ class Database:
     def add_library(self, path: Path | str) -> Library:
         resolved = str(Path(path).expanduser().resolve())
         existing = self.connection.execute(
-            "SELECT id, path, name, created_at, last_scan, available, last_error FROM libraries WHERE path = ?",
+            "SELECT * FROM libraries WHERE path = ?",
             (resolved,),
         ).fetchone()
         if existing:
@@ -159,13 +161,30 @@ class Database:
             last_scan=None,
             available=True,
             last_error=None,
+            mount_path=self.mount_path(Path(resolved)),
         )
         self.connection.execute(
-            "INSERT INTO libraries (id, path, name, created_at) VALUES (?, ?, ?, ?)",
-            (library.id, library.path, library.name, library.created_at),
+            "INSERT INTO libraries (id, path, name, created_at, mount_path) VALUES (?, ?, ?, ?, ?)",
+            (library.id, library.path, library.name, library.created_at, library.mount_path),
         )
         self.connection.commit()
         return library
+
+    @staticmethod
+    def mount_path(root: Path) -> str | None:
+        """Remember non-root mounts so an empty, unmounted mountpoint stays offline."""
+        for path in (root, *root.parents):
+            if path == Path(path.anchor):
+                break
+            if os.path.ismount(path):
+                return str(path)
+        return None
+
+    def unlink_library(self, library_id: str) -> None:
+        """Forget a library and its photo metadata without touching original files."""
+        with self.connection:
+            self.connection.execute("DELETE FROM images WHERE library_id = ?", (library_id,))
+            self.connection.execute("DELETE FROM libraries WHERE id = ?", (library_id,))
 
     # Scanner-facing methods -------------------------------------------
     def set_library_availability(
@@ -188,10 +207,6 @@ class Database:
         if not new_root.is_dir():
             raise ValueError("Choose an available folder.")
         old_root = Path(library.path)
-        if new_root == old_root:
-            self.set_library_availability(library_id, True)
-            return self.library(library_id) or library
-
         rows = self.connection.execute(
             "SELECT id, path FROM images WHERE library_id = ?",
             (library_id,),
@@ -219,10 +234,10 @@ class Database:
             self.connection.execute(
                 """
                 UPDATE libraries
-                SET path = ?, name = ?, available = 1, last_error = NULL
+                SET path = ?, name = ?, available = 1, last_error = NULL, mount_path = ?
                 WHERE id = ?
                 """,
-                (str(new_root), new_root.name or str(new_root), library_id),
+                (str(new_root), new_root.name or str(new_root), self.mount_path(new_root), library_id),
             )
         updated = self.library(library_id)
         if updated is None:
@@ -311,14 +326,16 @@ class Database:
         )
         return image_id, False
 
-    def finish_library_scan(self, library_id: str, found_ids: Iterable[str]) -> None:
+    def finish_library_scan(
+        self, library_id: str, found_ids: Iterable[str], *, mount_path: str | None = None
+    ) -> None:
         found = [(image_id,) for image_id in found_ids]
         self.connection.execute("UPDATE images SET missing = 1 WHERE library_id = ?", (library_id,))
         if found:
             self.connection.executemany("UPDATE images SET missing = 0 WHERE id = ?", found)
         self.connection.execute(
-            "UPDATE libraries SET last_scan = ?, available = 1, last_error = NULL WHERE id = ?",
-            (utc_now(), library_id),
+            "UPDATE libraries SET last_scan = ?, available = 1, last_error = NULL, mount_path = COALESCE(?, mount_path) WHERE id = ?",
+            (utc_now(), mount_path, library_id),
         )
         self.connection.commit()
 

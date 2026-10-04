@@ -4,10 +4,18 @@ import sqlite3
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QCursor,
+    QDesktopServices,
+    QKeySequence,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QApplication,
+    QButtonGroup,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -41,8 +49,8 @@ from .widgets import (
     ROLE_RECORD,
     AlbumButton,
     EmptyState,
-    GalleryDelegate,
     FolderTreeRow,
+    GalleryDelegate,
     GalleryList,
     InspectorPanel,
     NavButton,
@@ -422,7 +430,9 @@ class MainWindow(FramelessWindow):
                 else "Connected · includes nested folders"
             )
             button.setToolTip(
-                f"{status}\n{library.path}\nRight-click for reconnect options"
+                f"{status}\n{library.path}\n"
+                + (f"{library.last_error}\n" if library.last_error else "")
+                + "Right-click to rescan, reconnect, or unlink"
             )
             button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             button.customContextMenuRequested.connect(
@@ -666,7 +676,9 @@ class MainWindow(FramelessWindow):
                 item.setSelected(True)
 
         self._schedule_visible_thumbnails()
+        self._update_gallery_summary()
 
+    def _update_gallery_summary(self) -> None:
         count = len(self.current_images)
         label = "photo" if count == 1 else "photos"
         self.page_subtitle.setText(f"{count:,} {label} · originals stay on disk")
@@ -774,6 +786,8 @@ class MainWindow(FramelessWindow):
         menu.addSeparator()
         rescan = menu.addAction("Rescan this folder")
         locate = menu.addAction("Locate or reconnect folder…")
+        menu.addSeparator()
+        unlink = menu.addAction("Unlink folder…")
         selected = menu.exec(global_position)
         if selected == rescan:
             refreshed = self.database.library(current.id)
@@ -781,6 +795,49 @@ class MainWindow(FramelessWindow):
                 self.queue_scan([refreshed])
         elif selected == locate:
             self.locate_library(current)
+        elif selected == unlink:
+            self.unlink_library(current)
+
+    def unlink_library(self, library: Library) -> None:
+        current = self.database.library(library.id)
+        if current is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Unlink folder",
+            f"Unlink {current.name} from Luma?\n\n"
+            f"{current.path}\n\n"
+            "Original files and folders will stay on disk. Luma will remove this "
+            "folder's photos, saved details, tags, ratings, favorites, and album memberships "
+            "from the catalog. Adding it again starts a fresh scan.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._scan_queue = [item for item in self._scan_queue if item.id != current.id]
+        if self._scan_thread and self._scan_thread.library.id == current.id:
+            self._scan_thread.requestInterruption()
+            self._scan_thread.wait()
+        self.database.unlink_library(current.id)
+        if not self.database.libraries():
+            self._startup_scan_timer.stop()
+        root = Path(current.path)
+        self.expanded_folders = {
+            path for path in self.expanded_folders if not Path(path).is_relative_to(root)
+        }
+        self._save_expanded_folders()
+        if (
+            self.mode == "folder" and self.mode_value == current.id
+            or self.mode == "folder_path" and self.mode_value
+            and Path(self.mode_value).is_relative_to(root)
+        ):
+            self.mode = "all"
+            self.mode_value = None
+            self.page_title.setText("All Photos")
+        self.reload_sidebar()
+        self.reload_gallery()
+        self.statusBar().showMessage(f"Unlinked {current.name} · original files kept on disk", 7000)
 
     def locate_library(self, library: Library) -> None:
         old_root = Path(library.path)
@@ -800,6 +857,10 @@ class MainWindow(FramelessWindow):
                 selected_relative = Path(self.mode_value).relative_to(old_root)
             except ValueError:
                 pass
+        active_scan = self._scan_thread and self._scan_thread.library.id == library.id
+        if active_scan:
+            self._scan_thread.requestInterruption()
+            self._scan_thread.wait()
         try:
             updated = self.database.relink_library(library.id, path)
         except (sqlite3.IntegrityError, ValueError) as error:
@@ -809,7 +870,11 @@ class MainWindow(FramelessWindow):
             self.mode_value = str(Path(updated.path) / selected_relative)
         self.reload_sidebar()
         self.reload_gallery()
-        self.queue_scan([updated])
+        if active_scan:
+            self._scan_queue = [item for item in self._scan_queue if item.id != updated.id]
+            self._scan_queue.append(updated)
+        else:
+            self.queue_scan([updated])
         self.statusBar().showMessage(f"Reconnected {updated.name} · rescanning…")
 
     def rescan_all(self) -> None:
@@ -823,7 +888,9 @@ class MainWindow(FramelessWindow):
         queued_ids = {library.id for library in self._scan_queue}
         active_id = self._scan_thread.library.id if self._scan_thread else None
         self._scan_queue.extend(
-            library for library in libraries if library.id not in queued_ids and library.id != active_id
+            library for library in libraries
+            if library.id not in queued_ids and library.id != active_id
+            and self.database.library(library.id) is not None
         )
         self._start_next_scan()
 
@@ -832,7 +899,10 @@ class MainWindow(FramelessWindow):
             if not self._scan_thread:
                 self.rescan_button.setEnabled(True)
             return
-        library = self._scan_queue.pop(0)
+        library = self.database.library(self._scan_queue.pop(0).id)
+        if library is None:
+            self._start_next_scan()
+            return
         self.rescan_button.setEnabled(False)
         self.statusBar().showMessage(f"Scanning {library.name}…")
         thread = ScanThread(self.database_path, library, self)
@@ -845,6 +915,8 @@ class MainWindow(FramelessWindow):
         thread.start()
 
     def _scan_completed(self, result: ScanResult) -> None:
+        if self.database.library(result.library_id) is None:
+            return
         self._last_scan_result = result
         self.thumbnail_manager.reset_validation()
         self.reload_sidebar()
@@ -858,12 +930,14 @@ class MainWindow(FramelessWindow):
         self._scan_thread = None
         if thread:
             thread.deleteLater()
-        if self._last_scan_result:
+        if self._last_scan_result and self.database.library(self._last_scan_result.library_id):
             result = self._last_scan_result
             library = self.database.library(result.library_id)
             if not result.available:
                 name = library.name if library else "Folder"
                 summary = f"{name} is offline · mount or unlock it, then click Rescan"
+            elif result.error:
+                summary = result.error
             else:
                 summary = f"Indexed {result.discovered:,} photos"
                 if result.reconnected:
@@ -1062,10 +1136,28 @@ class MainWindow(FramelessWindow):
         if not self.current_images:
             return
         viewer = ImageViewer(self.database, self.current_images, image_id, self.cache_dir)
-        viewer.favorite_changed.connect(lambda _id, _favorite: self.reload_gallery())
+        viewer.favorite_changed.connect(self._viewer_favorite_changed)
         viewer.set_launch_window_state(self.windowState())
         viewer.exec()
-        self.reload_gallery()
+
+    def _viewer_favorite_changed(self, image_id: str, favorite: bool) -> None:
+        image = self.database.image(image_id)
+        item = self._items_by_id.get(image_id)
+        if image is None or item is None:
+            return
+        if self.mode == "favorites" and not favorite:
+            self._items_by_id.pop(image_id)
+            self.gallery.takeItem(self.gallery.row(item))
+            # The viewer keeps its own navigation list while the gallery filters change.
+            self.current_images = [record for record in self.current_images if record.id != image_id]
+            self._update_gallery_summary()
+            self._schedule_visible_thumbnails()
+        else:
+            item.setData(ROLE_FAVORITE, favorite)
+            item.setData(ROLE_RECORD, image)
+            self.current_images = [image if record.id == image_id else record for record in self.current_images]
+        if any(selected.data(ROLE_IMAGE_ID) == image_id for selected in self.gallery.selectedItems()):
+            self._selection_changed()
 
     # Window lifecycle -------------------------------------------------
     def _restore_window_state(self) -> None:

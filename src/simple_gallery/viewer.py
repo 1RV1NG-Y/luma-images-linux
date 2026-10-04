@@ -19,12 +19,14 @@ from PySide6.QtGui import (
     QImage,
     QImageReader,
     QKeyEvent,
+    QKeySequence,
     QMouseEvent,
     QPaintEvent,
     QPainter,
     QPixmap,
     QResizeEvent,
     QShowEvent,
+    QShortcut,
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
@@ -49,6 +51,7 @@ from .window_chrome import create_resize_handles, position_resize_handles
 class FullImageSignals(QObject):
     ready = Signal(str, object)
     failed = Signal(str, str)
+    metadata_ready = Signal(str, str, str)
 
 
 class FullImageTask(QRunnable):
@@ -65,6 +68,10 @@ class FullImageTask(QRunnable):
             return
         reader = QImageReader(self.source)
         reader.setAutoTransform(True)
+        values = {key.casefold(): reader.text(key).strip() for key in reader.textKeys()}
+        camera = " ".join(part for part in (values.get("make", ""), values.get("model", "")) if part)
+        lens = values.get("lensmodel", "") or values.get("lens", "")
+        self.signals.metadata_ready.emit(self.image_id, camera, lens)
         decoded = reader.read()
         if decoded.isNull():
             self.signals.failed.emit(
@@ -306,6 +313,7 @@ class ImageViewer(QDialog):
         self._image_pool = QThreadPool.globalInstance()
         self._pending_image_loads: set[str] = set()
         self._filmstrip_loaded: set[str] = set()
+        self._metadata_cache: dict[str, tuple[str, str]] = {}
         self._launch_window_state = Qt.WindowState.WindowNoState
         self._launch_state_pending = False
 
@@ -335,6 +343,13 @@ class ImageViewer(QDialog):
         root.addWidget(self.content, 1)
         root.addWidget(self._build_filmstrip())
 
+        self._previous_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        self._previous_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._previous_shortcut.activated.connect(self.previous)
+        self._next_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        self._next_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._next_shortcut.activated.connect(self.next)
+        self.image_view.setFocus()
         self._populate_filmstrip()
         self._show_current()
 
@@ -496,7 +511,7 @@ class ImageViewer(QDialog):
         albums = self.database.albums_for_image(image.id)
         self.detail_labels["Tags"].setText(", ".join(tags) or "—")
         self.detail_labels["Albums"].setText(", ".join(album.name for album in albums) or "—")
-        camera, lens = self._embedded_details(image.path)
+        camera, lens = self._metadata_cache.get(image.id, ("", ""))
         self.detail_labels["Camera"].setText(camera or "—")
         self.detail_labels["Lens"].setText(lens or "—")
         self.detail_path.setText(image.path)
@@ -508,19 +523,9 @@ class ImageViewer(QDialog):
         self.filmstrip.scrollToItem(self.filmstrip.item(self.index), QListWidget.ScrollHint.PositionAtCenter)
         self._request_full_image()
 
-    @staticmethod
-    def _embedded_details(path: str) -> tuple[str, str]:
-        reader = QImageReader(path)
-        values = {key.casefold(): reader.text(key).strip() for key in reader.textKeys()}
-        make = values.get("make", "")
-        model = values.get("model", "")
-        camera = " ".join(part for part in (make, model) if part)
-        lens = values.get("lensmodel", "") or values.get("lens", "")
-        return camera, lens
-
     def _request_full_image(self) -> None:
         image = self.current
-        if image.missing or not Path(image.path).exists():
+        if image.missing:
             self.image_view.set_message("Original file is unavailable")
             return
         thumbnail = self.cache_dir / f"{image.id}.jpg"
@@ -535,7 +540,14 @@ class ImageViewer(QDialog):
         task = FullImageTask(image.id, image.path)
         task.signals.ready.connect(self._full_image_loaded)
         task.signals.failed.connect(self._full_image_failed)
+        task.signals.metadata_ready.connect(self._metadata_loaded)
         self._image_pool.start(task)
+
+    def _metadata_loaded(self, image_id: str, camera: str, lens: str) -> None:
+        self._metadata_cache[image_id] = camera, lens
+        if image_id == self.current.id:
+            self.detail_labels["Camera"].setText(camera or "—")
+            self.detail_labels["Lens"].setText(lens or "—")
 
     def _full_image_loaded(self, image_id: str, decoded: object) -> None:
         self._pending_image_loads.discard(image_id)
@@ -546,7 +558,9 @@ class ImageViewer(QDialog):
 
     def _full_image_failed(self, image_id: str, message: str) -> None:
         self._pending_image_loads.discard(image_id)
-        if image_id == self.current.id and self.image_view._pixmap.isNull():
+        if image_id == self.current.id and (
+            self.image_view._pixmap.isNull() or message == "Original file is unavailable"
+        ):
             self.image_view.set_message(message)
 
     def _zoom_changed(self, factor: float) -> None:
